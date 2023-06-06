@@ -1,0 +1,12 @@
+go 1.18
+
+use (
+	./src
+	// ./app/rnx2rtkp
+	// ./unittest
+	//	./app/rtkrcv
+	// ./app/str2str
+	./app/convbin
+// ./app/plot
+// ./app/pos2kml
+)
