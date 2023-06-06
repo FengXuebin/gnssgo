@@ -1,0 +1,2136 @@
+/*------------------------------------------------------------------------------
+* rtkrcv.c : rtk-gps/gnss receiver console ap
+*
+*          Copyright (C) 2009-2015 by T.TAKASU, All rights reserved.
+*
+* notes   :
+*     current version does not support win32 without pthread library
+*
+* version : $Revision:$ $Date:$
+* history : 2009/12/13 1.0  new
+*           2010/07/18 1.1  add option -m
+*           2010/08/12 1.2  fix bug on ftp/http
+*           2011/01/22 1.3  add option misc-proxyaddr,misc-fswapmargin
+*           2011/08/19 1.4  fix bug on size of arg solopt arg for rtksvrstart()
+*           2012/11/03 1.5  fix bug on setting output format
+*           2013/06/30 1.6  add "nvs" option for inpstr*-format
+*           2014/02/10 1.7  fix bug on printing obs data
+*                           add print of status, glonass nav data
+*                           ignore SIGHUP
+*           2014/04/27 1.8  add "binex" option for inpstr*-format
+*           2014/08/10 1.9  fix cpu overload with abnormal telnet shutdown
+*           2014/08/26 1.10 support input format "rt17"
+*                           change file paths of solution status and debug trace
+*           2015/01/10 1.11 add line editting and command history
+*                           separate codes for virtual console to vt.c
+*           2015/05/22 1.12 fix bug on sp3 id in inpstr*-format options
+*           2015/07/31 1.13 accept 4:stat for outstr1-format or outstr2-format
+*                           add reading satellite dcb
+*           2015/12/14 1.14 add option -sta for station name (#339)
+*           2015/12/25 1.15 fix bug on -sta option (#339)
+*           2015/01/26 1.16 support septentrio
+*           2016/07/01 1.17 support CMR/CMR+
+*           2016/08/20 1.18 add output of patch level with version
+*           2016/09/05 1.19 support ntrip caster for output stream
+*           2016/09/19 1.20 support multiple remote console connections
+*                           add option -w
+*           2017/09/01 1.21 add command ssr
+*-----------------------------------------------------------------------------*/
+
+package main
+
+import (
+	"bufio"
+	"flag"
+	"fmt"
+	"gnssgo"
+	"log"
+	"math"
+	"os"
+	"os/signal"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+)
+
+var PRGNAME string = "rtkrcv"                    /* program name */
+var CMDPROMPT string = "rtkrcv> "                /* command prompt */
+var MAXCON int = 32                              /* max number of consoles */
+var MAXARG int = 10                              /* max number of args in a command */
+var MAXCMD int = 256                             /* max length of a command */
+var MAXSTR int = 1024                            /* max length of a stream */
+var OPTSDIR string = "."                         /* default config directory */
+var OPTSFILE string = "rtkrcv.conf"              /* default config file */
+var NAVIFILE string = "rtkrcv.nav"               /* navigation save file */
+var STATFILE string = "rtkrcv_%Y%m%d%h%M.stat"   /* solution status file */
+var TRACEFILE string = "rtkrcv_%Y%m%d%h%M.trace" /* debug trace file */
+var INTKEEPALIVE int = 1000                      /* keep alive interval (ms) */
+
+var ESC_CLEAR string = "\033[H\033[2J" /* ansi/vt100 escape: erase screen */
+var ESC_RESET string = "\033[0m"       /* ansi/vt100: reset attribute */
+var ESC_BOLD string = "\033[1m"        /* ansi/vt100: bold */
+var D2R = gnssgo.D2R
+var R2D = gnssgo.R2D
+
+/* type defintions -----------------------------------------------------------*/
+
+type con_t struct { /* console type */
+	state int            /* state (0:stop,1:run) */
+	vt    *VTerm         /* virtual terminal */
+	wg    sync.WaitGroup /* console thread */
+}
+
+/* function prototypes -------------------------------------------------------*/
+// extern FILE *popen(const char *, const char *);
+// extern int pclose(FILE *);
+
+/* global variables ----------------------------------------------------------*/
+var (
+	svr  gnssgo.RtkSvr /* rtk server struct */
+	moni gnssgo.Stream /* monitor stream */
+
+	intflg = 0 /* interrupt flag (2:shtdown) */
+
+	passwd   = "admin" /* login password */
+	timetype = 0       /* time format (0:gpst,1:utc,2:jst,3:tow) */
+	soltype  = 0       /* sol format (0:dms,1:deg,2:xyz,3:enu,4:pyl) */
+	solflag  = 2       /* sol flag (1:std+2:age/ratio/ns) */
+	strtype  = []int{  /* stream types */
+		gnssgo.STR_SERIAL, gnssgo.STR_NONE, gnssgo.STR_NONE,
+		gnssgo.STR_NONE, gnssgo.STR_NONE, gnssgo.STR_NONE,
+		gnssgo.STR_NONE, gnssgo.STR_NONE}
+	strpath = [8]string{"", "", "", "", "", "", "", ""} /* stream paths */
+	strfmt  = []int{                                    /* stream formats */
+		gnssgo.STRFMT_UBX, gnssgo.STRFMT_RTCM3, gnssgo.STRFMT_SP3, gnssgo.SOLF_LLH, gnssgo.SOLF_NMEA}
+	svrcycle    = 10                 /* server cycle (ms) */
+	timeout     = 10000              /* timeout time (ms) */
+	reconnect   = 10000              /* reconnect interval (ms) */
+	nmeacycle   = 5000               /* nmea request cycle (ms) */
+	buffsize    = 32768              /* input buffer size (bytes) */
+	navmsgsel   = 0                  /* navigation mesaage select */
+	proxyaddr   = ""                 /* http/ntrip proxy */
+	nmeareq     = 0                  /* nmea request type (0:off,1:lat/lon,2:single) */
+	nmeapos     = []float64{0, 0, 0} /* nmea position (lat/lon/height) (deg,m) */
+	rcvcmds     [3]string            /* receiver commands files */
+	startcmd    = ""                 /* start command */
+	stopcmd     = ""                 /* stop command */
+	modflgr     [256]int             /* modified flags of receiver options */
+	modflgs     [256]int             /* modified flags of system options */
+	moniport    = 0                  /* monitor port */
+	keepalive   = 0                  /* keep alive flag */
+	fswapmargin = 30                 /* file swap margin (s) */
+	sta_name    = ""                 /* station name */
+
+	prcopt gnssgo.PrcOpt    /* processing options */
+	solopt [2]gnssgo.SolOpt /* solution options */
+	filopt gnssgo.FilOpt /* file options */)
+
+/* help text -----------------------------------------------------------------*/
+var usage []string = []string{
+	"usage: rtkrcv [-s][-p port][-d dev][-o file][-w pwd][-r level][-t level][-sta sta]",
+	"options",
+	"  -s         start RTK server on program startup",
+	"  -p port    port number for telnet console",
+	"  -m port    port number for monitor stream",
+	"  -d dev     terminal device for console",
+	"  -o file    processing options file",
+	"  -w pwd     login password for remote console (\"\": no password)",
+	"  -r level   output solution status file (0:off,1:states,2:residuals)",
+	"  -t level   debug trace level (0:off,1-5:on)",
+	"  -sta sta   station name for receiver dcb"}
+var helptxt []string = []string{
+	"start                 : start rtk server",
+	"stop                  : stop rtk server",
+	"restart               : restart rtk sever",
+	"solution [cycle]      : show solution",
+	"status [cycle]        : show rtk status",
+	"satellite [-n] [cycle]: show satellite status",
+	"observ [-n] [cycle]   : show observation data",
+	"navidata [cycle]      : show navigation data",
+	"stream [cycle]        : show stream status",
+	"ssr [cycle]           : show ssr corrections",
+	"error                 : show error/warning messages",
+	"option [opt]          : show option(s)",
+	"set opt [val]         : set option",
+	"load [file]           : load options from file",
+	"save [file]           : save options to file",
+	"log [file|off]        : start/stop log to file",
+	"help|? [path]         : print help",
+	"exit|ctr-D            : logout console (only for telnet)",
+	"shutdown              : shutdown rtk server",
+	"!command [arg...]     : execute command in shell",
+					""}
+var pathopts []string = []string{ /* path options help */
+	"stream path formats",
+	"serial   : port[:bit_rate[:byte[:parity(n|o|e)[:stopb[:fctr(off|on)]]]]]",
+	"file     : path[::T[::+offset][::xspeed]]",
+	"tcpsvr   : :port",
+	"tcpcli   : addr:port",
+	"ntripsvr : user:passwd@addr:port/mntpnt[:str]",
+	"ntripcli : user:passwd@addr:port/mntpnt",
+	"ntripc_s : :passwd@:port",
+	"ntripc_c : user:passwd@:port",
+	"ftp      : user:passwd@addr/path[::T=poff,tint,off,rint]",
+	"http     : addr/path[::T=poff,tint,off,rint]",
+	""}
+
+/* receiver options table ----------------------------------------------------*/
+var TIMOPT string = "0:gpst,1:utc,2:jst,3:tow"
+var CONOPT string = "0:dms,1:deg,2:xyz,3:enu,4:pyl"
+var FLGOPT string = "0:off,1:std+2:age/ratio/ns"
+var ISTOPT string = "0:off,1:serial,2:file,3:tcpsvr,4:tcpcli,5:ntripsvr,6:ntripcli,7:ftp,8:http"
+var OSTOPT string = "0:off,1:serial,2:file,3:tcpsvr,4:tcpcli,6:ntripsvr,11:ntripc_c"
+var FMTOPT string = "0:rtcm2,1:rtcm3,2:oem4,3:oem3,4:ubx,5:ss2,6:hemis,7:skytraq,8:gw10,9:javad,10:nvs,11:binex,12:rt17,13:sbf,14:cmr,15:tersus,18:sp3"
+var NMEOPT string = "0:off,1:latlon,2:single"
+var SOLOPT string = "0:llh,1:xyz,2:enu,3:nmea,4:stat"
+var MSGOPT string = "0:all,1:rover,2:base,3:corr"
+
+var rcvopts map[string]*gnssgo.Opt = map[string]*gnssgo.Opt{
+	"console-passwd":   {Name: "console-passwd", Format: 2, VarInt: nil, VarFloat: nil, VarString: &passwd, Comment: ""},
+	"console-timetype": {Name: "console-timetype", Format: 3, VarInt: &timetype, VarFloat: nil, VarString: nil, Comment: TIMOPT},
+	"console-soltype":  {Name: "console-soltype", Format: 3, VarInt: &soltype, VarFloat: nil, VarString: nil, Comment: CONOPT},
+	"console-solflag":  {Name: "console-solflag", Format: 0, VarInt: &solflag, VarFloat: nil, VarString: nil, Comment: FLGOPT},
+	"inpstr1-type":     {Name: "inpstr1-type", Format: 3, VarInt: &strtype[0], VarFloat: nil, VarString: nil, Comment: ISTOPT},
+	"inpstr2-type":     {Name: "inpstr2-type", Format: 3, VarInt: &strtype[1], VarFloat: nil, VarString: nil, Comment: ISTOPT},
+	"inpstr3-type":     {Name: "inpstr3-type", Format: 3, VarInt: &strtype[2], VarFloat: nil, VarString: nil, Comment: ISTOPT},
+	"inpstr1-path":     {Name: "inpstr1-path", Format: 2, VarInt: nil, VarFloat: nil, VarString: &strpath[0], Comment: ""},
+	"inpstr2-path":     {Name: "inpstr2-path", Format: 2, VarInt: nil, VarFloat: nil, VarString: &strpath[1], Comment: ""},
+	"inpstr3-path":     {Name: "inpstr3-path", Format: 2, VarInt: nil, VarFloat: nil, VarString: &strpath[2], Comment: ""},
+	"inpstr1-format":   {Name: "inpstr1-format", Format: 3, VarInt: &strfmt[0], VarFloat: nil, VarString: nil, Comment: FMTOPT},
+	"inpstr2-format":   {Name: "inpstr2-format", Format: 3, VarInt: &strfmt[1], VarFloat: nil, VarString: nil, Comment: FMTOPT},
+	"inpstr3-format":   {Name: "inpstr3-format", Format: 3, VarInt: &strfmt[2], VarFloat: nil, VarString: nil, Comment: FMTOPT},
+	"inpstr2-nmeareq":  {Name: "inpstr2-nmeareq", Format: 3, VarInt: &nmeareq, VarFloat: nil, VarString: nil, Comment: NMEOPT},
+	"inpstr2-nmealat":  {Name: "inpstr2-nmealat", Format: 1, VarInt: nil, VarFloat: &nmeapos[0], VarString: nil, Comment: "deg"},
+	"inpstr2-nmealon":  {Name: "inpstr2-nmealon", Format: 1, VarInt: nil, VarFloat: &nmeapos[1], VarString: nil, Comment: "deg"},
+	"inpstr2-nmeahgt":  {Name: "inpstr2-nmeahgt", Format: 1, VarInt: nil, VarFloat: &nmeapos[2], VarString: nil, Comment: "m"},
+	"outstr1-type":     {Name: "outstr1-type", Format: 3, VarInt: &strtype[3], VarFloat: nil, VarString: nil, Comment: OSTOPT},
+	"outstr2-type":     {Name: "outstr2-type", Format: 3, VarInt: &strtype[4], VarFloat: nil, VarString: nil, Comment: OSTOPT},
+	"outstr1-path":     {Name: "outstr1-path", Format: 2, VarInt: nil, VarFloat: nil, VarString: &strpath[3], Comment: ""},
+	"outstr2-path":     {Name: "outstr2-path", Format: 2, VarInt: nil, VarFloat: nil, VarString: &strpath[4], Comment: ""},
+	"outstr1-format":   {Name: "outstr1-format", Format: 3, VarInt: &strfmt[3], VarFloat: nil, VarString: nil, Comment: SOLOPT},
+	"outstr2-format":   {Name: "outstr2-format", Format: 3, VarInt: &strfmt[4], VarFloat: nil, VarString: nil, Comment: SOLOPT},
+	"logstr1-type":     {Name: "logstr1-type", Format: 3, VarInt: &strtype[5], VarFloat: nil, VarString: nil, Comment: OSTOPT},
+	"logstr2-type":     {Name: "logstr2-type", Format: 3, VarInt: &strtype[6], VarFloat: nil, VarString: nil, Comment: OSTOPT},
+	"logstr3-type":     {Name: "logstr3-type", Format: 3, VarInt: &strtype[7], VarFloat: nil, VarString: nil, Comment: OSTOPT},
+	"logstr1-path":     {Name: "logstr1-path", Format: 2, VarInt: nil, VarFloat: nil, VarString: &strpath[5], Comment: ""},
+	"logstr2-path":     {Name: "logstr2-path", Format: 2, VarInt: nil, VarFloat: nil, VarString: &strpath[6], Comment: ""},
+	"logstr3-path":     {Name: "logstr3-path", Format: 2, VarInt: nil, VarFloat: nil, VarString: &strpath[7], Comment: ""},
+	"misc-svrcycle":    {Name: "misc-svrcycle", Format: 0, VarInt: &svrcycle, VarFloat: nil, VarString: nil, Comment: "ms"},
+	"misc-timeout":     {Name: "misc-timeout", Format: 0, VarInt: &timeout, VarFloat: nil, VarString: nil, Comment: "ms"},
+	"misc-reconnect":   {Name: "misc-reconnect", Format: 0, VarInt: &reconnect, VarFloat: nil, VarString: nil, Comment: "ms"},
+	"misc-nmeacycle":   {Name: "misc-nmeacycle", Format: 0, VarInt: &nmeacycle, VarFloat: nil, VarString: nil, Comment: "ms"},
+	"misc-buffsize":    {Name: "misc-buffsize", Format: 0, VarInt: &buffsize, VarFloat: nil, VarString: nil, Comment: "bytes"},
+	"misc-navmsgsel":   {Name: "misc-navmsgsel", Format: 3, VarInt: &navmsgsel, VarFloat: nil, VarString: nil, Comment: MSGOPT},
+	"misc-proxyaddr":   {Name: "misc-proxyaddr", Format: 2, VarInt: nil, VarFloat: nil, VarString: &proxyaddr, Comment: ""},
+	"misc-fswapmargin": {Name: "misc-fswapmargin", Format: 0, VarInt: &fswapmargin, VarFloat: nil, VarString: nil, Comment: "s"},
+
+	"misc-startcmd": {Name: "misc-startcmd", Format: 2, VarInt: nil, VarFloat: nil, VarString: &startcmd, Comment: ""},
+	"misc-stopcmd":  {Name: "misc-stopcmd", Format: 2, VarInt: nil, VarFloat: nil, VarString: &stopcmd, Comment: ""},
+
+	"file-cmdfile1": {Name: "file-cmdfile1", Format: 2, VarInt: nil, VarFloat: nil, VarString: &rcvcmds[0], Comment: ""},
+	"file-cmdfile2": {Name: "file-cmdfile2", Format: 2, VarInt: nil, VarFloat: nil, VarString: &rcvcmds[1], Comment: ""},
+	"file-cmdfile3": {Name: "file-cmdfile3", Format: 2, VarInt: nil, VarFloat: nil, VarString: &rcvcmds[2], Comment: ""}}
+
+func printusage() {
+	for _, v := range usage {
+		fmt.Fprintf(os.Stderr, v+"\n")
+	}
+
+}
+func searchHelp(key string) string {
+	for _, v := range helptxt {
+		if strings.Contains(v, key) {
+			return v
+		}
+	}
+	return "no surported augument"
+}
+func inet_addr(ipaddr string) [4]byte {
+	var (
+		ips = strings.Split(ipaddr, ".")
+		ip  [4]uint64
+		ret [4]byte
+	)
+	for i := 0; i < 4; i++ {
+		ip[i], _ = strconv.ParseUint(ips[i], 10, 8)
+	}
+	for i := 0; i < 4; i++ {
+		ret[i] = byte(ip[i])
+	}
+	return ret
+}
+
+/* discard space characters at tail ------------------------------------------*/
+func chop(str *string) {
+	*str = strings.TrimRightFunc(*str, func(r rune) bool {
+		return !strconv.IsGraphic(r)
+	})
+}
+
+/* open socket for remote console --------------------------------------------*/
+func open_sock(port int) int {
+	// var on int= 1;
+	// var sock net.Conn
+	log.Printf("open_sock: port=%d\n", port)
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		log.Printf("socket error (%s)\n", err)
+	}
+	sa := &syscall.SockaddrInet4{Addr: inet_addr("127.0.0.1"), Port: port}
+
+	syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+	err = syscall.Bind(fd, sa)
+	if err != nil {
+		log.Printf("Failed to bind to Addr: %v, Port: %d, Reason: %s", "127.0.0.1", port, err)
+		return -1
+	}
+
+	err = syscall.Listen(fd, 5)
+	if err != nil {
+		log.Printf("Failed to listen")
+		return -1
+	}
+
+	return int(fd)
+	// if ((sock=socket(AF_INET,SOCK_STREAM,0))<0) {
+	//     fprintf(stderr,"socket error (%d)\n",errno);
+	//     return 0;
+	// }
+	// setsockopt(sock,SOL_SOCKET,SO_REUSEADDR,(const char *)&on,sizeof(on));
+	// memset(&addr,0,sizeof(addr));
+	// addr.sin_family=AF_INET;
+	// addr.sin_port=htons(port);
+
+	// if (bind(sock,(struct sockaddr *)&addr,sizeof(addr))<0) {
+	//     fprintf(stderr,"bind error (%d)\n",errno);
+	//     close(sock);
+	//     return -1;
+	// }
+	// listen(sock,5);
+	// return sock;
+}
+
+/* close console -------------------------------------------------------------*/
+func con_close(con *con_t) {
+	log.Printf("con_close:\n")
+
+	if con == nil {
+		return
+	}
+	con.state, con.vt.state = 0, 0
+	con.wg.Wait()
+	con = nil
+}
+
+/* accept remote console connection ------------------------------------------*/
+func accept_sock(ssock int, con []*con_t) {
+	// struct timeval tv={0};
+	// struct sockaddr_in addr;
+	// socklen_t len=sizeof(addr);
+	// fd_set rs;
+	var i int
+	var sock syscall.Handle
+	var err error
+	var addr syscall.Sockaddr
+
+	if ssock <= 0 {
+		return
+	}
+
+	log.Printf("accept_sock: ssock=%d\n", ssock)
+
+	for i = 1; i < MAXCON; i++ {
+		if con[i] != nil {
+			if con[i].state == 0 {
+				continue
+			}
+		}
+		con_close(con[i])
+		con[i] = nil
+	}
+	if sock, addr, err = syscall.Accept(syscall.Handle(ssock)); err != nil {
+		return
+	}
+	// FD_ZERO(&rs);
+	// FD_SET(ssock,&rs);
+	// if (select(ssock+1,&rs,NULL,NULL,&tv)<=0) {
+	//     return;
+	// }
+	// if ((sock=accept(ssock,(struct sockaddr *)&addr,&len))<=0) {
+	//     return;
+	// }
+	for i = 1; i < MAXCON; i++ {
+		if con[i] != nil {
+			continue
+		}
+
+		con[i] = con_open(sock, "")
+		fmt.Printf("addr: %v\n", addr)
+		// log.Printf("remote console connected: addr=%s\n",
+		//       addr.Addr);
+		return
+	}
+	syscall.Close(sock)
+	// trace(2,"remote console connection refused. addr=%s\n",
+	//      inet_ntoa(addr.sin_addr));
+}
+
+/* confirm overwrite ---------------------------------------------------------*/
+func confwrite(vt *VTerm, file string) int {
+	var fp *os.File
+	var buff string
+
+	buff = file
+	if idx := strings.Index(buff, "::"); idx >= 0 {
+		buff = buff[:idx]
+	} /* omit options in path */
+	fp, _ = os.OpenFile(buff, os.O_RDONLY, 0666)
+	if vt.state == 0 || fp == nil {
+		return 1 /* no existing file */
+	}
+	fp.Close()
+	vt.vt_printf("overwrite %-16s ? (y/n): ", buff)
+	if vt.vt_gets([]byte(buff), len(buff)) == 0 || vt.brk > 0 {
+		return 0
+	}
+	buff = strings.ToUpper(buff)
+	if buff[0] == 'Y' {
+		return 1
+	}
+	return 0
+}
+
+/* login ---------------------------------------------------------------------*/
+func login(vt *VTerm) int {
+	var buff string
+
+	log.Printf("login: passwd=%s type=%d\n", passwd, vt.ttype)
+
+	if len(passwd) == 0 || vt.ttype == 0 {
+		return 1
+	}
+
+	for (intflg & 2) == 0 {
+		if vt.vt_printf("password: %s", PRGNAME) == 0 {
+			return 0
+		}
+		vt.blind = 1
+		if vt.vt_gets([]byte(buff), len(buff)) == 0 || vt.brk > 0 {
+			vt.blind = 0
+			return 0
+		}
+		vt.blind = 0
+		if strings.Compare(buff, passwd) == 0 {
+			break
+		}
+		vt.vt_printf("\ninvalid password\n")
+	}
+	return 1
+}
+
+/* read receiver commands ----------------------------------------------------*/
+func readcmd(file string, cmd *string, ctype int) int {
+	var fp *os.File
+	var buff string
+	//,*p=cmd;
+	var i int = 0
+	var err error
+
+	log.Printf("readcmd: file=%s\n", file)
+
+	if fp, _ = os.OpenFile(file, os.O_RDONLY, 0666); fp == nil {
+		return 0
+	}
+	rd := bufio.NewReader(fp)
+	for {
+		buff, err = rd.ReadString('\n')
+		if err != nil {
+			break
+		}
+		if buff[0] == '@' {
+			i++
+		} else if i == ctype && len(*cmd)+len(buff)+1 < gnssgo.MAXRCVCMD {
+			*cmd += fmt.Sprintf("%s", buff)
+		}
+	}
+	fp.Close()
+	return 1
+}
+
+/* read antenna file ---------------------------------------------------------*/
+func readant(vt *VTerm, opt *gnssgo.PrcOpt, nav *gnssgo.Nav) {
+	var pcv0 gnssgo.Pcv
+	var pcvr, pcvs gnssgo.Pcvs
+	var pcv *gnssgo.Pcv
+	var time gnssgo.Gtime = gnssgo.TimeGet()
+	var i int
+
+	log.Printf("readant:\n")
+
+	opt.Pcvr[0], opt.Pcvr[1] = pcv0, pcv0
+	if len(filopt.RcvAntPara) == 0 {
+		return
+	}
+
+	if gnssgo.ReadPcv(filopt.RcvAntPara, &pcvr) != 0 {
+		for i = 0; i < 2; i++ {
+			if len(opt.AntType[i]) == 0 {
+				continue
+			}
+			if pcv = gnssgo.SearchPcv(0, opt.AntType[i], time, &pcvr); pcv == nil {
+				vt.vt_printf("no antenna %s in %s", opt.AntType[i], filopt.RcvAntPara)
+				continue
+			}
+			opt.Pcvr[i] = *pcv
+		}
+	} else {
+		vt.vt_printf("antenna file open error %s", filopt.RcvAntPara)
+	}
+
+	if gnssgo.ReadPcv(filopt.SatAntPara, &pcvs) > 0 {
+		for i = 0; i < gnssgo.MAXSAT; i++ {
+			if pcv = gnssgo.SearchPcv(i+1, "", time, &pcvs); pcv == nil {
+				continue
+			}
+			nav.Pcvs[i] = *pcv
+		}
+	} else {
+		vt.vt_printf("antenna file open error %s", filopt.SatAntPara)
+	}
+
+	pcvr.Pcv = nil
+	pcvs.Pcv = nil
+}
+
+/* start rtk server ----------------------------------------------------------*/
+func startsvr(vt *VTerm) int {
+	var sta [gnssgo.MAXRCV]gnssgo.Sta
+	var pos, npos [3]float64
+	var s1 [3]string = [3]string{"", "", ""}
+	var cmds [3]string
+	var s2 [3]string = [3]string{"", "", ""}
+	var cmds_periodic [3]string
+	var ropts []string = []string{"", "", ""}
+	var paths []string = []string{
+		strpath[0], strpath[1], strpath[2], strpath[3], strpath[4], strpath[5],
+		strpath[6], strpath[7]}
+	var errmsg string = ""
+	var i int
+	var stropt [8]int
+
+	log.Printf("startsvr:\n")
+
+	/* read start commads from command files */
+	for i = 0; i < 3; i++ {
+		if len(rcvcmds[i]) == 0 {
+			continue
+		}
+		if readcmd(rcvcmds[i], &s1[i], 0) == 0 {
+			vt.vt_printf("no command file: %s\n", rcvcmds[i])
+		} else {
+			cmds[i] = s1[i]
+		}
+		if readcmd(rcvcmds[i], &s2[i], 2) == 0 {
+			vt.vt_printf("no command file: %s\n", rcvcmds[i])
+		} else {
+			cmds_periodic[i] = s2[i]
+		}
+	}
+	/* confirm overwrite */
+	// for i = 3; i < 8; i++ {
+	// 	if strtype[i] == int(gnssgo.STR_FILE) && confwrite(vt, strpath[i]) == 0 {
+	// 		return 0
+	// 	}
+	// }
+	if prcopt.RefPos == 4 { /* rtcm */
+		for i = 0; i < 3; i++ {
+			prcopt.Rb[i] = 0.0
+		}
+	}
+	pos[0] = nmeapos[0] * D2R
+	pos[1] = nmeapos[1] * D2R
+	pos[2] = nmeapos[2]
+	gnssgo.Pos2Ecef(pos[:], npos[:])
+
+	/* read antenna file */
+	readant(vt, &prcopt, &svr.NavData)
+
+	/* read dcb file */
+	if len(filopt.Dcb) > 0 {
+		sta[0].Name = sta_name
+		svr.NavData.ReadDcb(filopt.Dcb, sta[:])
+	}
+	/* open geoid data file */
+	if solopt[0].Geoid > 0 && gnssgo.OpenGeoid(solopt[0].Geoid, filopt.Geoid) == 0 {
+		log.Printf("geoid data open error: %s\n", filopt.Geoid)
+		vt.vt_printf("geoid data open error: %s\n", filopt.Geoid)
+	}
+	// for  i=0; len(rcvopts[i].Name)>0 ;i++ { modflgr[i]=0;}
+	// for  i=0; len(gnssgo.SysOpts[i].Name)>0;i++ { modflgs[i]=0;}
+
+	/* set stream options */
+	stropt[0] = timeout
+	stropt[1] = reconnect
+	stropt[2] = 1000
+	stropt[3] = buffsize
+	stropt[4] = fswapmargin
+	gnssgo.StreamSetOpt(stropt[:])
+
+	if strfmt[2] == 8 {
+		strfmt[2] = int(gnssgo.STRFMT_SP3)
+	}
+
+	/* set ftp/http directory and proxy */
+	gnssgo.StreamSetDir(filopt.TempDir)
+	gnssgo.StreamSetProxy(proxyaddr)
+
+	/* execute start command */
+	if len(startcmd) > 0 && gnssgo.ExecCmd(startcmd) < 0 {
+		log.Printf("command exec error: %s \n", startcmd)
+		vt.vt_printf("command exec error: %s  \n", startcmd)
+	}
+	solopt[0].Posf = strfmt[3]
+	solopt[1].Posf = strfmt[4]
+
+	/* start rtk server */
+	if svr.RtkSvrStart(svrcycle, buffsize, strtype, paths, strfmt, navmsgsel,
+		cmds[:], cmds_periodic[:], ropts, nmeacycle, nmeareq, npos[:], &prcopt,
+		solopt[:], &moni, &errmsg) == 0 {
+		log.Printf("rtk server start error (%s)\n", errmsg)
+		vt.vt_printf("rtk server start error (%s)\n", errmsg)
+		return 0
+	}
+	return 1
+}
+
+/* stop rtk server -----------------------------------------------------------*/
+func stopsvr(vt *VTerm) {
+	var s [3]string = [3]string{"", "", ""}
+	var cmds [3]string
+	var i int
+
+	log.Printf("stopsvr:\n")
+
+	if svr.State == 0 {
+		return
+	}
+
+	/* read stop commads from command files */
+	for i = 0; i < 3; i++ {
+		if len(rcvcmds[i]) == 0 {
+			continue
+		}
+		if readcmd(rcvcmds[i], &s[i], 1) == 0 {
+			vt.vt_printf("no command file: %s\n", rcvcmds[i])
+		} else {
+			cmds[i] = s[i]
+		}
+	}
+	/* stop rtk server */
+	svr.RtkSvrStop(cmds[:])
+
+	/* execute stop command */
+	if len(stopcmd) > 0 && gnssgo.ExecCmd(stopcmd) < 0 {
+		log.Printf("command exec error: %s \n", stopcmd)
+		vt.vt_printf("command exec error: %s \n", stopcmd)
+	}
+	if solopt[0].Geoid > 0 {
+		gnssgo.CloseGeoid()
+	}
+
+	vt.vt_printf("stop rtk server\n")
+}
+
+/* print time ----------------------------------------------------------------*/
+func prtime(vt *VTerm, time gnssgo.Gtime) {
+	var tow float64
+	var week int
+	var tstr string
+
+	if timetype == 1 {
+		gnssgo.Time2Str(gnssgo.GpsT2Utc(time), &tstr, 2)
+	} else if timetype == 2 {
+		gnssgo.Time2Str(gnssgo.TimeAdd(gnssgo.GpsT2Utc(time), 9*3600.0), &tstr, 2)
+	} else if timetype == 3 {
+		tow = gnssgo.Time2GpsT(time, &week)
+		tstr = fmt.Sprintf("  %04d %9.2f", week, tow)
+	} else {
+		gnssgo.Time2Str(time, &tstr, 1)
+	}
+	vt.vt_printf("%s ", tstr)
+}
+
+/* print solution ------------------------------------------------------------*/
+func prsolution(vt *VTerm, sol *gnssgo.Sol, rb []float64) {
+	var solstr []string = []string{"------", "FIX", "FLOAT", "SBAS", "DGPS", "SINGLE", "PPP", ""}
+	var pos, dms1, dms2, bl, enu [3]float64
+	var Qr, Qe [9]float64
+	var pitch, yaw, length float64
+	var i int
+
+	log.Printf("prsolution:\n")
+
+	if sol.Time.Time == 0 || sol.Stat == 0 {
+		return
+	}
+	prtime(vt, sol.Time)
+	vt.vt_printf("(%-6s)", solstr[sol.Stat])
+
+	if gnssgo.Norm(sol.Rr[:], 3) > 0.0 && gnssgo.Norm(rb, 3) > 0.0 {
+		for i = 0; i < 3; i++ {
+			bl[i] = sol.Rr[i] - rb[i]
+		}
+	}
+	length = gnssgo.Norm(bl[:], 3)
+	Qr[0] = float64(sol.Qr[0])
+	Qr[4] = float64(sol.Qr[1])
+	Qr[8] = float64(sol.Qr[2])
+	Qr[1], Qr[3] = float64(sol.Qr[3]), float64(sol.Qr[3])
+	Qr[5], Qr[7] = float64(sol.Qr[4]), float64(sol.Qr[4])
+	Qr[2], Qr[6] = float64(sol.Qr[5]), float64(sol.Qr[5])
+
+	if soltype == 0 {
+		if gnssgo.Norm(sol.Rr[:], 3) > 0.0 {
+			gnssgo.Ecef2Pos(sol.Rr[:], pos[:])
+			gnssgo.Cov2Enu(pos[:], Qr[:], Qe[:])
+			gnssgo.Deg2Dms(pos[0]*R2D, dms1[:], 4)
+			gnssgo.Deg2Dms(pos[1]*R2D, dms2[:], 4)
+			if solopt[0].Height == 1 {
+				pos[2] -= gnssgo.GeoidH(pos[:]) /* geodetic */
+			}
+		}
+		if pos[0] < 0 {
+			vt.vt_printf(" %s:%2.0f %02.0f %07.4f", "S", math.Abs(dms1[0]), dms1[1], dms1[2])
+		} else {
+			vt.vt_printf(" %s:%2.0f %02.0f %07.4f", "N", math.Abs(dms1[0]), dms1[1], dms1[2])
+		}
+		if pos[1] < 0 {
+			vt.vt_printf(" %s:%3.0f %02.0f %07.4f", "W", math.Abs(dms2[0]), dms2[1], dms2[2])
+		} else {
+			vt.vt_printf(" %s:%3.0f %02.0f %07.4f", "E", math.Abs(dms2[0]), dms2[1], dms2[2])
+		}
+		vt.vt_printf(" H:%8.3f", pos[2])
+		if solflag&1 != 0 {
+			vt.vt_printf(" (N:%6.3f E:%6.3f U:%6.3f)", gnssgo.SQRT(Qe[4]), gnssgo.SQRT(Qe[0]), gnssgo.SQRT(Qe[8]))
+		}
+	} else if soltype == 1 {
+		if gnssgo.Norm(sol.Rr[:], 3) > 0.0 {
+			gnssgo.Ecef2Pos(sol.Rr[:], pos[:])
+			gnssgo.Cov2Enu(pos[:], Qr[:], Qe[:])
+			if solopt[0].Height == 1 {
+				pos[2] -= gnssgo.GeoidH(pos[:]) /* geodetic */
+			}
+		}
+		if pos[0] < 0.0 {
+			vt.vt_printf(" %s:%11.8f", "S", math.Abs(pos[0])*R2D)
+		} else {
+			vt.vt_printf(" %s:%11.8f", "N", math.Abs(pos[0])*R2D)
+		}
+		if pos[1] < 0.0 {
+			vt.vt_printf(" %s:%12.8f", "W", math.Abs(pos[1])*R2D)
+		} else {
+			vt.vt_printf(" %s:%12.8f", "E", math.Abs(pos[1])*R2D)
+		}
+		vt.vt_printf(" H:%8.3f", pos[2])
+		if solflag&1 > 0 {
+			vt.vt_printf(" (E:%6.3f N:%6.3f U:%6.3fm)", gnssgo.SQRT(Qe[0]), gnssgo.SQRT(Qe[4]), gnssgo.SQRT(Qe[8]))
+		}
+	} else if soltype == 2 {
+		vt.vt_printf(" X:%12.3f", sol.Rr[0])
+		vt.vt_printf(" Y:%12.3f", sol.Rr[1])
+		vt.vt_printf(" Z:%12.3f", sol.Rr[2])
+		if solflag&1 > 0 {
+			vt.vt_printf(" (X:%6.3f Y:%6.3f Z:%6.3f)", gnssgo.SQRT(Qr[0]), gnssgo.SQRT(Qr[4]), gnssgo.SQRT(Qr[8]))
+		}
+	} else if soltype == 3 {
+		if length > 0.0 {
+			gnssgo.Ecef2Pos(rb[:], pos[:])
+			gnssgo.Ecef2Enu(pos[:], bl[:], enu[:])
+			gnssgo.Cov2Enu(pos[:], Qr[:], Qe[:])
+		}
+		vt.vt_printf(" E:%12.3f", enu[0])
+		vt.vt_printf(" N:%12.3f", enu[1])
+		vt.vt_printf(" U:%12.3f", enu[2])
+		if solflag&1 > 0 {
+			vt.vt_printf(" (E:%6.3f N:%6.3f U:%6.3f)", gnssgo.SQRT(Qe[0]), gnssgo.SQRT(Qe[4]), gnssgo.SQRT(Qe[8]))
+		}
+	} else if soltype == 4 {
+		if length > 0.0 {
+			gnssgo.Ecef2Pos(rb[:], pos[:])
+			gnssgo.Ecef2Enu(pos[:], bl[:], enu[:])
+			gnssgo.Cov2Enu(pos[:], Qr[:], Qe[:])
+			pitch = math.Asin(enu[2] / length)
+			yaw = math.Atan2(enu[0], enu[1])
+			if yaw < 0.0 {
+				yaw += 2.0 * gnssgo.PI
+			}
+		}
+		vt.vt_printf(" P:%12.3f", pitch*R2D)
+		vt.vt_printf(" Y:%12.3f", yaw*R2D)
+		vt.vt_printf(" L:%12.3f", length)
+		if solflag&1 > 0 {
+			vt.vt_printf(" (E:%6.3f N:%6.3f U:%6.3f)", gnssgo.SQRT(Qe[0]), gnssgo.SQRT(Qe[4]), gnssgo.SQRT(Qe[8]))
+		}
+	}
+	if solflag&2 > 0 {
+		vt.vt_printf(" A:%4.1f R:%5.1f N:%2d", sol.Age, sol.Ratio, sol.Ns)
+	}
+	vt.vt_printf("\n")
+}
+
+/* print status --------------------------------------------------------------*/
+func prstatus(vt *VTerm) {
+	var rtk gnssgo.Rtk
+	var svrstate []string = []string{"stop", "run"}
+	var stype []string = []string{"rover", "base", "corr"}
+	var sol []string = []string{"-", "fix", "float", "SBAS", "DGPS", "single", "PPP", ""}
+	var mode []string = []string{
+		"single", "DGPS", "kinematic", "static", "moving-base", "fixed",
+		"PPP-kinema", "PPP-static"}
+	var freq []string = []string{"-", "L1", "L1+L2", "L1+L2+L5", "", "", ""}
+	var rtcm [3]gnssgo.Rtcm
+	var cputime, i, j, n, thread, cycle, state, rtkstat, nsat0, nsat1, prcout, nave int
+	var nb [3]int
+	var nmsg [3][10]int
+	var tstr, s string
+	var runtime, bl1, bl2 float64
+	var rr, rt, pos, vel [3]float64
+	var dop [4]float64
+	var azel [gnssgo.MAXSAT * 2]float64
+	var del []float64
+
+	log.Printf("prstatus:\n")
+
+	svr.RtkSvrLock()
+	rtk = svr.RtkCtrl
+	//   thread= svr.thread;
+	cycle = svr.Cycle
+	state = svr.State
+	rtkstat = int(svr.RtkCtrl.RtkSol.Stat)
+	nsat0 = svr.ObsData[0][0].N()
+	nsat1 = svr.ObsData[1][0].N()
+	cputime = svr.CpuTime
+	prcout = svr.PrcOut
+	nave = svr.NAve
+	for i = 0; i < 3; i++ {
+		nb[i] = svr.Nb[i]
+	}
+	for i = 0; i < 3; i++ {
+		for j = 0; j < 10; j++ {
+			nmsg[i][j] = int(svr.InputMsg[i][j])
+		}
+	}
+	if svr.State > 0 {
+		runtime = float64(gnssgo.TickGet()-int64(svr.Tick)) / 1000.0
+		rt[0] = math.Floor(runtime / 3600.0)
+		runtime -= rt[0] * 3600.0
+		rt[1] = math.Floor(runtime / 60.0)
+		rt[2] = runtime - rt[1]*60.0
+	}
+	for i = 0; i < 3; i++ {
+		rtcm[i] = svr.RtcmCtrl[i]
+	}
+	svr.RtkSvrUnlock()
+
+	for i, n = 0, 0; i < gnssgo.MAXSAT; i++ {
+		if rtk.Opt.Mode == int(gnssgo.PMODE_SINGLE) && rtk.Ssat[i].Vs == 0 {
+			continue
+		}
+		if rtk.Opt.Mode != int(gnssgo.PMODE_SINGLE) && rtk.Ssat[i].Vsat[0] == 0 {
+			continue
+		}
+		azel[n*2] = rtk.Ssat[i].Azel[0]
+		azel[1+n*2] = rtk.Ssat[i].Azel[1]
+		n++
+	}
+	gnssgo.DOPs(n, azel[:], 0.0, dop[:])
+
+	vt.vt_printf("\n%s%-28s: %s%s\n", ESC_BOLD, "Parameter", "Value", ESC_RESET)
+	vt.vt_printf("%-28s: %s %s\n", "rtklib version", gnssgo.VER_GNSSGO, gnssgo.PATCH_LEVEL)
+	vt.vt_printf("%-28s: %d\n", "rtk server thread", thread)
+	vt.vt_printf("%-28s: %s\n", "rtk server state", svrstate[state])
+	vt.vt_printf("%-28s: %d\n", "processing cycle (ms)", cycle)
+	vt.vt_printf("%-28s: %s\n", "positioning mode", mode[rtk.Opt.Mode])
+	vt.vt_printf("%-28s: %s\n", "frequencies", freq[rtk.Opt.Nf])
+	vt.vt_printf("%-28s: %02.0f:%02.0f:%04.1f\n", "accumulated time to run", rt[0], rt[1], rt[2])
+	vt.vt_printf("%-28s: %d\n", "cpu time for a cycle (ms)", cputime)
+	vt.vt_printf("%-28s: %d\n", "missing obs data count", prcout)
+	vt.vt_printf("%-28s: %d,%d\n", "bytes in input buffer", nb[0], nb[1])
+	for i = 0; i < 3; i++ {
+		s = fmt.Sprintf("# of input data %s", stype[i])
+		vt.vt_printf("%-28s: obs(%d),nav(%d),gnav(%d),ion(%d),sbs(%d),pos(%d),dgps(%d),ssr(%d),err(%d)\n",
+			s, nmsg[i][0], nmsg[i][1], nmsg[i][6], nmsg[i][2], nmsg[i][3],
+			nmsg[i][4], nmsg[i][5], nmsg[i][7], nmsg[i][9])
+	}
+	for i = 0; i < 3; i++ {
+		// p=s; *p='\0';
+		p := s
+
+		for j = 1; j < 100; j++ {
+			if rtcm[i].Nmsg2[j] == 0 {
+				continue
+			}
+			if len(p) == len(s) {
+				p += fmt.Sprintf(" %d(%d)", j, rtcm[i].Nmsg2[j])
+			} else {
+				p += fmt.Sprintf(", %d(%d)", j, rtcm[i].Nmsg2[j])
+			}
+		}
+		if rtcm[i].Nmsg2[0] > 0 {
+			if len(p) > len(s) {
+				p = fmt.Sprintf(",other2(%d)", rtcm[i].Nmsg2[0])
+			} else {
+				p = fmt.Sprintf("other2(%d)", rtcm[i].Nmsg2[0])
+			}
+		}
+		for j = 1; j < 300; j++ {
+			if rtcm[i].Nmsg3[j] == 0 {
+				continue
+			}
+			if len(p) > len(s) {
+				p += fmt.Sprintf(",%d(%d)", j+1000, rtcm[i].Nmsg3[j])
+			} else {
+				p += fmt.Sprintf("%d(%d)", j+1000, rtcm[i].Nmsg3[j])
+			}
+		}
+		if rtcm[i].Nmsg3[0] > 0 {
+			if len(p) > len(s) {
+				p = fmt.Sprintf(",other3(%d)", rtcm[i].Nmsg3[0])
+			} else {
+				p = fmt.Sprintf("other3(%d)", rtcm[i].Nmsg3[0])
+			}
+		}
+		vt.vt_printf("%-15s %-9s: %s\n", "# of rtcm messages", stype[i], s)
+	}
+	vt.vt_printf("%-28s: %s\n", "solution status", sol[rtkstat])
+	gnssgo.Time2Str(rtk.RtkSol.Time, &tstr, 9)
+	if rtk.RtkSol.Time.Time > 0 {
+		vt.vt_printf("%-28s: %s\n", "time of receiver clock rover", tstr)
+	} else {
+		vt.vt_printf("%-28s: %s\n", "time of receiver clock rover", "-")
+	}
+	vt.vt_printf("%-28s: %.3f,%.3f,%.3f,%.3f\n", "time sys offset (ns)", rtk.RtkSol.Dtr[1]*1e9,
+		rtk.RtkSol.Dtr[2]*1e9, rtk.RtkSol.Dtr[3]*1e9, rtk.RtkSol.Dtr[4]*1e9)
+	vt.vt_printf("%-28s: %.3f\n", "solution interval (s)", rtk.Tt)
+	vt.vt_printf("%-28s: %.3f\n", "age of differential (s)", rtk.RtkSol.Age)
+	vt.vt_printf("%-28s: %.3f\n", "ratio for ar validation", rtk.RtkSol.Ratio)
+	vt.vt_printf("%-28s: %d\n", "# of satellites rover", nsat0)
+	vt.vt_printf("%-28s: %d\n", "# of satellites base", nsat1)
+	vt.vt_printf("%-28s: %d\n", "# of valid satellites", rtk.RtkSol.Ns)
+	vt.vt_printf("%-28s: %.1f,%.1f,%.1f,%.1f\n", "GDOP/PDOP/HDOP/VDOP", dop[0], dop[1], dop[2], dop[3])
+	vt.vt_printf("%-28s: %d\n", "# of real estimated states", rtk.Na)
+	vt.vt_printf("%-28s: %d\n", "# of all estimated states", rtk.Nx)
+	vt.vt_printf("%-28s: %.3f,%.3f,%.3f\n", "pos xyz single (m) rover",
+		rtk.RtkSol.Rr[0], rtk.RtkSol.Rr[1], rtk.RtkSol.Rr[2])
+	if gnssgo.Norm(rtk.RtkSol.Rr[:], 3) > 0.0 {
+		gnssgo.Ecef2Pos(rtk.RtkSol.Rr[:], pos[:])
+	} else {
+		pos[0], pos[1], pos[2] = 0.0, 0.0, 0.0
+	}
+	vt.vt_printf("%-28s: %.8f,%.8f,%.3f\n", "pos llh single (deg,m) rover",
+		pos[0]*R2D, pos[1]*R2D, pos[2])
+	gnssgo.Ecef2Enu(pos[:], rtk.RtkSol.Rr[3:], vel[:])
+	vt.vt_printf("%-28s: %.3f,%.3f,%.3f\n", "vel enu (m/s) rover", vel[0], vel[1], vel[2])
+	if rtk.X != nil {
+		vt.vt_printf("%-28s: %.3f,%.3f,%.3f\n", "pos xyz float (m) rover",
+			rtk.X[0], rtk.X[1], rtk.X[2])
+	} else {
+		vt.vt_printf("%-28s: %.3f,%.3f,%.3f\n", "pos xyz float (m) rover", 0.0, 0.0, 0.0)
+	}
+
+	if rtk.P != nil {
+		vt.vt_printf("%-28s: %.3f,%.3f,%.3f\n", "pos xyz float std (m) rover",
+			gnssgo.SQRT(rtk.P[0]), gnssgo.SQRT(rtk.P[1+1*rtk.Nx]), gnssgo.SQRT(rtk.P[2+2*rtk.Nx]))
+	} else {
+		vt.vt_printf("%-28s: %.3f,%.3f,%.3f\n", "pos xyz float std (m) rover", 0.0, 0.0, 0.0)
+	}
+	if rtk.Xa != nil {
+		vt.vt_printf("%-28s: %.3f,%.3f,%.3f\n", "pos xyz fixed (m) rover",
+			rtk.Xa[0], rtk.Xa[1], rtk.Xa[2])
+	} else {
+		vt.vt_printf("%-28s: %.3f,%.3f,%.3f\n", "pos xyz fixed (m) rover", 0.0, 0.0, 0.0)
+	}
+	if rtk.Pa != nil {
+		vt.vt_printf("%-28s: %.3f,%.3f,%.3f\n", "pos xyz fixed std (m) rover",
+			gnssgo.SQRT(rtk.Pa[0]), gnssgo.SQRT(rtk.Pa[1+1*rtk.Na]), gnssgo.SQRT(rtk.Pa[2+2*rtk.Na]))
+	} else {
+		vt.vt_printf("%-28s: %.3f,%.3f,%.3f\n", "pos xyz fixed std (m) rover", 0.0, 0.0, 0.0)
+	}
+
+	vt.vt_printf("%-28s: %.3f,%.3f,%.3f\n", "pos xyz (m) base",
+		rtk.Rb[0], rtk.Rb[1], rtk.Rb[2])
+	if gnssgo.Norm(rtk.Rb[:], 3) > 0.0 {
+		gnssgo.Ecef2Pos(rtk.Rb[:], pos[:])
+	} else {
+		pos[0], pos[1], pos[2] = 0.0, 0.0, 0.0
+	}
+	vt.vt_printf("%-28s: %.8f,%.8f,%.3f\n", "pos llh (deg,m) base",
+		pos[0]*R2D, pos[1]*R2D, pos[2])
+	vt.vt_printf("%-28s: %d\n", "# of average single pos base", nave)
+	vt.vt_printf("%-28s: %s\n", "ant type rover", rtk.Opt.Pcvr[0].Type)
+	del = rtk.Opt.AntDel[0][:]
+	vt.vt_printf("%-28s: %.3f %.3f %.3f\n", "ant delta rover", del[0], del[1], del[2])
+	vt.vt_printf("%-28s: %s\n", "ant type base", rtk.Opt.Pcvr[1].Type)
+	del = rtk.Opt.AntDel[1][:]
+	vt.vt_printf("%-28s: %.3f %.3f %.3f\n", "ant delta base", del[0], del[1], del[2])
+	gnssgo.Ecef2Enu(pos[:], rtk.Rb[3:], vel[:])
+	vt.vt_printf("%-28s: %.3f,%.3f,%.3f\n", "vel enu (m/s) base",
+		vel[0], vel[1], vel[2])
+	if rtk.Opt.Mode > 0 && rtk.X != nil && gnssgo.Norm(rtk.X[:], 3) > 0.0 {
+		for i = 0; i < 3; i++ {
+			rr[i] = rtk.X[i] - rtk.Rb[i]
+		}
+		bl1 = gnssgo.Norm(rr[:], 3)
+	}
+	if rtk.Opt.Mode > 0 && rtk.Xa != nil && gnssgo.Norm(rtk.Xa, 3) > 0.0 {
+		for i = 0; i < 3; i++ {
+			rr[i] = rtk.Xa[i] - rtk.Rb[i]
+		}
+		bl2 = gnssgo.Norm(rr[:], 3)
+	}
+	vt.vt_printf("%-28s: %.3f\n", "baseline length float (m)", bl1)
+	vt.vt_printf("%-28s: %.3f\n", "baseline length fixed (m)", bl2)
+	vt.vt_printf("%-28s: %d\n", "monitor port", moniport)
+}
+
+/* print satellite -----------------------------------------------------------*/
+func prsatellite(vt *VTerm, nf int) {
+	var rtk gnssgo.Rtk
+	var az, el float64
+	var id string
+	var i, j, fix int
+	var frq []int = []int{1, 2, 5, 7, 8, 6}
+
+	log.Printf("prsatellite:\n")
+
+	svr.RtkSvrLock()
+	rtk = svr.RtkCtrl
+	svr.RtkSvrUnlock()
+	if nf <= 0 || nf > gnssgo.NFREQ {
+		nf = gnssgo.NFREQ
+	}
+	vt.vt_printf("\n%s%3s %2s %5s %4s", ESC_BOLD, "SAT", "C1", "Az", "El")
+	for j = 0; j < nf; j++ {
+		vt.vt_printf(" L%d", frq[j])
+	}
+	for j = 0; j < nf; j++ {
+		vt.vt_printf("  Fix%d", frq[j])
+	}
+	for j = 0; j < nf; j++ {
+		vt.vt_printf("  P%dRes", frq[j])
+	}
+	for j = 0; j < nf; j++ {
+		vt.vt_printf("   L%dRes", frq[j])
+	}
+	for j = 0; j < nf; j++ {
+		vt.vt_printf("  Sl%d", frq[j])
+	}
+	for j = 0; j < nf; j++ {
+		vt.vt_printf("  Lock%d", frq[j])
+	}
+	for j = 0; j < nf; j++ {
+		vt.vt_printf(" Rj%d", frq[j])
+	}
+	vt.vt_printf("%s\n", ESC_RESET)
+
+	for i = 0; i < gnssgo.MAXSAT; i++ {
+		if rtk.Ssat[i].Azel[1] <= 0.0 {
+			continue
+		}
+		gnssgo.SatNo2Id(i+1, &id)
+		if rtk.Ssat[i].Vs > 0 {
+			vt.vt_printf("%3s %2s", id, "OK")
+		} else {
+			vt.vt_printf("%3s %2s", id, "-")
+		}
+
+		az = rtk.Ssat[i].Azel[0] * R2D
+		if az < 0.0 {
+			az += 360.0
+		}
+		el = rtk.Ssat[i].Azel[1] * R2D
+		vt.vt_printf(" %5.1f %4.1f", az, el)
+		for j = 0; j < nf; j++ {
+			if rtk.Ssat[i].Vsat[j] > 0 {
+				vt.vt_printf(" %2s", "OK")
+			} else {
+				vt.vt_printf(" %2s", "-")
+			}
+		}
+		for j = 0; j < nf; j++ {
+			fix = int(rtk.Ssat[i].Fix[j])
+			switch fix {
+			case 1:
+				vt.vt_printf(" %5s", "FLOAT")
+			case 2:
+				vt.vt_printf(" %5s", "FIX")
+			case 3:
+				vt.vt_printf(" %5s", "HOLD")
+			default:
+				vt.vt_printf(" %5s", "-")
+			}
+		}
+		for j = 0; j < nf; j++ {
+			vt.vt_printf("%7.3f", rtk.Ssat[i].Resp[j])
+		}
+		for j = 0; j < nf; j++ {
+			vt.vt_printf("%8.4f", rtk.Ssat[i].Resc[j])
+		}
+		for j = 0; j < nf; j++ {
+			vt.vt_printf(" %4d", rtk.Ssat[i].Slipc[j])
+		}
+		for j = 0; j < nf; j++ {
+			vt.vt_printf(" %6d", rtk.Ssat[i].Lock[j])
+		}
+		for j = 0; j < nf; j++ {
+			vt.vt_printf(" %3d", rtk.Ssat[i].Rejc[j])
+		}
+		vt.vt_printf("\n")
+	}
+}
+
+/* print observation data ----------------------------------------------------*/
+func probserv(vt *VTerm, nf int) {
+	var obs [gnssgo.MAXOBS * 2]gnssgo.ObsD
+	var tstr, id string
+	var i, j, n int
+	var frq []int = []int{1, 2, 5, 7, 8, 6, 9}
+
+	log.Printf("probserv:\n")
+
+	svr.RtkSvrLock()
+	for i = 0; i < svr.ObsData[0][0].N() && n < gnssgo.MAXOBS*2; i++ {
+		obs[n] = svr.ObsData[0][0].Data[i]
+		n++
+	}
+	for i = 0; i < svr.ObsData[1][0].N() && n < gnssgo.MAXOBS*2; i++ {
+		obs[n] = svr.ObsData[1][0].Data[i]
+		n++
+	}
+	svr.RtkSvrUnlock()
+
+	if nf <= 0 || nf > gnssgo.NFREQ {
+		nf = gnssgo.NFREQ
+	}
+	vt.vt_printf("\n%s%-22s %3s %s", ESC_BOLD, "      TIME(GPST)", "SAT", "R")
+	for i = 0; i < nf; i++ {
+		vt.vt_printf("        P%d(m)", frq[i])
+	}
+	for i = 0; i < nf; i++ {
+		vt.vt_printf("       L%d(cyc)", frq[i])
+	}
+	for i = 0; i < nf; i++ {
+		vt.vt_printf("  D%d(Hz)", frq[i])
+	}
+	for i = 0; i < nf; i++ {
+		vt.vt_printf(" S%d", frq[i])
+	}
+	vt.vt_printf(" LLI%s\n", ESC_RESET)
+	for i = 0; i < n; i++ {
+		gnssgo.Time2Str(obs[i].Time, &tstr, 2)
+		gnssgo.SatNo2Id(obs[i].Sat, &id)
+		vt.vt_printf("%s %3s %d", tstr, id, obs[i].Rcv)
+		for j = 0; j < nf; j++ {
+			vt.vt_printf("%13.3f", obs[i].P[j])
+		}
+		for j = 0; j < nf; j++ {
+			vt.vt_printf("%14.3f", obs[i].L[j])
+		}
+		for j = 0; j < nf; j++ {
+			vt.vt_printf("%8.1f", obs[i].D[j])
+		}
+		for j = 0; j < nf; j++ {
+			vt.vt_printf("%3.0f", float32(obs[i].SNR[j])*gnssgo.SNR_UNIT)
+		}
+		for j = 0; j < nf; j++ {
+			vt.vt_printf("%2d", obs[i].LLI[j])
+		}
+		vt.vt_printf("\n")
+	}
+}
+
+/* print navigation data -----------------------------------------------------*/
+func prnavidata(vt *VTerm) {
+	var eph [gnssgo.MAXSAT]gnssgo.Eph
+	var geph [gnssgo.MAXPRNGLO]gnssgo.GEph
+	var ion, utc [8]float64
+	var time gnssgo.Gtime
+	var id, s1, s2, s3 string
+	var i, valid, prn int
+
+	log.Printf("prnavidata:\n")
+
+	svr.RtkSvrLock()
+	time = svr.RtkCtrl.RtkSol.Time
+	for i = 0; i < gnssgo.MAXSAT; i++ {
+		eph[i] = svr.NavData.Eph[i]
+	}
+	for i = 0; i < gnssgo.MAXPRNGLO; i++ {
+		geph[i] = svr.NavData.Geph[i]
+	}
+	for i = 0; i < 8; i++ {
+		ion[i] = svr.NavData.Ion_gps[i]
+	}
+	for i = 0; i < 8; i++ {
+		utc[i] = svr.NavData.Utc_gps[i]
+	}
+	svr.RtkSvrUnlock()
+
+	vt.vt_printf("\n%s%3s %3s %3s %3s %3s %3s %3s %19s %19s %19s %3s %3s%s\n",
+		ESC_BOLD, "SAT", "S", "IOD", "IOC", "FRQ", "A/A", "SVH", "Toe", "Toc",
+		"Ttr/Tof", "L2C", "L2P", ESC_RESET)
+	for i = 0; i < gnssgo.MAXSAT; i++ {
+		if (gnssgo.SatSys(i+1, &prn)&(gnssgo.SYS_GPS|gnssgo.SYS_GAL|gnssgo.SYS_QZS|gnssgo.SYS_CMP)) == 0 ||
+			eph[i].Sat != i+1 {
+			continue
+		}
+		valid = 0
+		if eph[i].Toe.Time != 0 && eph[i].Svh == 0 &&
+			math.Abs(gnssgo.TimeDiff(time, eph[i].Toe)) <= float64(gnssgo.MAXDTOE) {
+			valid = 1
+		}
+		gnssgo.SatNo2Id(i+1, &id)
+		if eph[i].Toe.Time != 0 {
+			gnssgo.Time2Str(eph[i].Toe, &s1, 0)
+		} else {
+			s1 = "-"
+		}
+		if eph[i].Toc.Time != 0 {
+			gnssgo.Time2Str(eph[i].Toc, &s2, 0)
+		} else {
+			s2 = "-"
+		}
+		if eph[i].Ttr.Time != 0 {
+			gnssgo.Time2Str(eph[i].Ttr, &s3, 0)
+		} else {
+			s3 = "-"
+		}
+		if valid > 0 {
+			vt.vt_printf("%3s %3s %3d %3d %3d %3d %03X %19s %19s %19s %3d %3d\n",
+				id, "OK", eph[i].Iode, eph[i].Iodc, 0, eph[i].Sva,
+				eph[i].Svh, s1, s2, s3, eph[i].Code, eph[i].Flag)
+		} else {
+			vt.vt_printf("%3s %3s %3d %3d %3d %3d %03X %19s %19s %19s %3d %3d\n",
+				id, "-", eph[i].Iode, eph[i].Iodc, 0, eph[i].Sva,
+				eph[i].Svh, s1, s2, s3, eph[i].Code, eph[i].Flag)
+		}
+	}
+	for i = 0; i < gnssgo.MAXSAT; i++ {
+		if (gnssgo.SatSys(i+1, &prn)&gnssgo.SYS_GLO) == 0 || geph[prn-1].Sat != i+1 {
+			continue
+		}
+		valid = 0
+		if geph[prn-1].Toe.Time != 0 && geph[prn-1].Svh == 0 &&
+			math.Abs(gnssgo.TimeDiff(time, geph[prn-1].Toe)) <= float64(gnssgo.MAXDTOE_GLO) {
+			valid = 1
+		}
+		gnssgo.SatNo2Id(i+1, &id)
+		if geph[prn-1].Toe.Time != 0 {
+			gnssgo.Time2Str(geph[prn-1].Toe, &s1, 0)
+		} else {
+			s1 = "-"
+		}
+		if geph[prn-1].Tof.Time != 0 {
+			gnssgo.Time2Str(geph[prn-1].Tof, &s2, 0)
+		} else {
+			s2 = "-"
+		}
+		if valid > 0 {
+			vt.vt_printf("%3s %3s %3d %3d %3d %3d  %02X %19s %19s %19s %3d %3d\n",
+				id, "OK", geph[prn-1].Iode, 0, geph[prn-1].Frq,
+				geph[prn-1].Age, geph[prn].Svh, s1, "-", s2, 0, 0)
+		} else {
+			vt.vt_printf("%3s %3s %3d %3d %3d %3d  %02X %19s %19s %19s %3d %3d\n",
+				id, "-", geph[prn-1].Iode, 0, geph[prn-1].Frq,
+				geph[prn-1].Age, geph[prn].Svh, s1, "-", s2, 0, 0)
+		}
+	}
+	vt.vt_printf("ION: %9.2E %9.2E %9.2E %9.2E %9.2E %9.2E %9.2E %9.2E\n",
+		ion[0], ion[1], ion[2], ion[3], ion[4], ion[5], ion[6], ion[7])
+	vt.vt_printf("UTC: %9.2E %9.2E %9.2E %9.2E  LEAPS: %.0f\n", utc[0], utc[1],
+		utc[2], utc[3], utc[4])
+}
+
+/* print error/warning messages ----------------------------------------------*/
+func prerror(vt *VTerm) {
+	var n int
+
+	log.Printf("prerror:\n")
+
+	svr.RtkSvrLock()
+	if n = len(svr.RtkCtrl.ErrBuf); n > 0 {
+		svr.RtkCtrl.ErrBuf = svr.RtkCtrl.ErrBuf[:n]
+		vt.vt_puts([]byte(svr.RtkCtrl.ErrBuf))
+	}
+	svr.RtkSvrUnlock()
+}
+
+/* print stream --------------------------------------------------------------*/
+func prstream(vt *VTerm) {
+	var ch []string = []string{
+		"input rover", "input base", "input corr", "output sol1", "output sol2",
+		"log rover", "log base", "log corr", "monitor"}
+	var stype []string = []string{
+		"-", "serial", "file", "tcpsvr", "tcpcli", "udp", "ntrips", "ntripc", "ftp",
+		"http", "ntripc_s", "ntripc_c"}
+	var fmt []string = []string{"rtcm2", "rtcm3", "oem4", "oem3", "ubx", "ss2", "hemis", "skytreq",
+		"gw10", "javad", "nvs", "binex", "rt17", "sbf", "cmr", "", "", "sp3", ""}
+	var sol []string = []string{"llh", "xyz", "enu", "nmea", "stat", "-"}
+	var stream [9]gnssgo.Stream
+	var i int
+	var format [9]int
+
+	log.Printf("prstream:\n")
+
+	svr.RtkSvrLock()
+	for i = 0; i < 8; i++ {
+		stream[i] = svr.Stream[i]
+	}
+	for i = 0; i < 3; i++ {
+		format[i] = svr.Format[i]
+	}
+	for i = 3; i < 5; i++ {
+		format[i] = svr.Solopt[i-3].Posf
+	}
+	stream[8] = moni
+	format[8] = int(gnssgo.SOLF_LLH)
+	svr.RtkSvrUnlock()
+
+	vt.vt_printf("\n%s%-12s %-8s %-5s %s %10s %7s %10s %7s %-24s %s%s\n", ESC_BOLD,
+		"Stream", "Type", "Fmt", "S", "In-byte", "In-bps", "Out-byte", "Out-bps",
+		"Path", "Message", ESC_RESET)
+	for i = 0; i < 9; i++ {
+		s1 := "-"
+		if i < 3 {
+			s1 = fmt[format[i]]
+		} else if i < 5 || i == 8 {
+			s1 = sol[format[i]]
+		}
+		s2 := "-"
+		if stream[i].State < 0 {
+			s2 = "E"
+		} else if stream[i].State > 0 {
+			s2 = "C"
+		}
+		vt.vt_printf("%-12s %-8s %-5s %s %10d %7d %10d %7d %-24.24s %s\n",
+			ch[i], stype[stream[i].Type], s1, s2,
+			stream[i].InBytes, stream[i].InRate, stream[i].OutBytes, stream[i].OutRate,
+			stream[i].Path, stream[i].Msg)
+	}
+}
+
+/* print ssr correction ------------------------------------------------------*/
+func prssr(vt *VTerm) {
+	var buff string
+	var time gnssgo.Gtime
+	var ssr [gnssgo.MAXSAT]gnssgo.SSR
+	var i int
+	var tstr, id string
+
+	svr.RtkSvrLock()
+	time = svr.RtkCtrl.RtkSol.Time
+	for i = 0; i < gnssgo.MAXSAT; i++ {
+		ssr[i] = svr.NavData.Ssr[i]
+	}
+	svr.RtkSvrUnlock()
+
+	buff += fmt.Sprintf("\n%s%3s %3s %3s %3s %3s %19s %6s %6s %6s %6s %6s %6s %8s %6s %6s %6s%s\n",
+		ESC_BOLD, "SAT", "S", "UDI", "IOD", "URA", "T0", "D0-A", "D0-C", "D0-R",
+		"D1-A", "D1-C", "D1-R", "C0", "C1", "C2", "C-HR", ESC_RESET)
+	for i = 0; i < gnssgo.MAXSAT; i++ {
+		if ssr[i].T0[0].Time == 0 {
+			continue
+		}
+		gnssgo.SatNo2Id(i+1, &id)
+		s1 := "-"
+		if math.Abs(gnssgo.TimeDiff(time, ssr[i].T0[0])) <= 1800.0 {
+			s1 = "OK"
+		}
+		gnssgo.Time2Str(ssr[i].T0[0], &tstr, 0)
+
+		buff += fmt.Sprintf("%3s %3s %3.0f %3d %3d %19s %6.3f %6.3f %6.3f %6.3f %6.3f %6.3f %8.3f %6.3f %6.4f %6.3f\n",
+			id, s1, ssr[i].Udi[0], ssr[i].Iode, ssr[i].Ura, tstr,
+			ssr[i].Deph[0], ssr[i].Deph[1], ssr[i].Deph[2],
+			ssr[i].Ddeph[0]*1e3, ssr[i].Ddeph[1]*1e3, ssr[i].Ddeph[2]*1e3,
+			ssr[i].Dclk[0], ssr[i].Dclk[1]*1e3, ssr[i].Dclk[2]*1e3,
+			ssr[i].Brclk)
+	}
+	vt.vt_puts([]byte(buff))
+}
+
+/* start command -------------------------------------------------------------*/
+func cmd_start(args []string, narg int, vt *VTerm) {
+	log.Printf("cmd_start:\n")
+
+	if startsvr(vt) == 0 {
+		return
+	}
+	vt.vt_printf("rtk server start\n")
+}
+
+/* stop command --------------------------------------------------------------*/
+func cmd_stop(args []string, narg int, vt *VTerm) {
+	log.Printf("cmd_stop:\n")
+
+	stopsvr(vt)
+	vt.vt_printf("rtk server stop\n")
+}
+
+/* restart command -----------------------------------------------------------*/
+func cmd_restart(args []string, narg int, vt *VTerm) {
+	log.Printf("cmd_restart:\n")
+
+	stopsvr(vt)
+	if startsvr(vt) == 0 {
+		return
+	}
+	vt.vt_printf("rtk server restart\n")
+}
+
+/* solution command ----------------------------------------------------------*/
+func cmd_solution(args []string, narg int, vt *VTerm) {
+	var i, cycle int
+
+	log.Printf("cmd_solution:\n")
+
+	if narg > 1 {
+		f, err := strconv.ParseFloat(args[1], 64)
+		if err != nil {
+			return
+		}
+		cycle = int(f * 1000.0)
+	}
+
+	if cycle > 0 {
+		svr.NoSol = 0
+	}
+
+	for vt.vt_chkbrk() == 0 {
+		svr.RtkSvrLock()
+		for i = 0; i < svr.NoSol; i++ {
+			prsolution(vt, &svr.SolBuf[i], svr.RtkCtrl.Rb[:])
+		}
+		svr.NoSol = 0
+		svr.RtkSvrUnlock()
+		if cycle > 0 {
+			gnssgo.Sleepms(cycle)
+		} else {
+			return
+		}
+	}
+}
+
+/* status command ------------------------------------------------------------*/
+func cmd_status(args []string, narg int, vt *VTerm) {
+	var cycle int = 0
+
+	log.Printf("cmd_status:\n")
+
+	if narg > 1 {
+		f, err := strconv.ParseFloat(args[1], 64)
+		if err != nil {
+			return
+		}
+		cycle = int(f * 1000.0)
+	}
+
+	for vt.vt_chkbrk() == 0 {
+		if cycle > 0 {
+			vt.vt_printf(ESC_CLEAR)
+		}
+		prstatus(vt)
+		if cycle > 0 {
+			gnssgo.Sleepms(cycle)
+		} else {
+			return
+		}
+	}
+	vt.vt_printf("\n")
+}
+
+/* satellite command ---------------------------------------------------------*/
+func cmd_satellite(args []string, narg int, vt *VTerm) {
+	var (
+		i     int
+		nf    int = 2
+		cycle int = 0
+	)
+	log.Printf("cmd_satellite:\n")
+
+	for i = 1; i < narg; i++ {
+		if n, _ := fmt.Sscanf(args[i], "-%d", &nf); n < 1 {
+			f, err := strconv.ParseFloat(args[i], 64)
+			if err != nil {
+				return
+			}
+			cycle = int(f * 1000.0)
+		}
+	}
+	for vt.vt_chkbrk() == 0 {
+		if cycle > 0 {
+			vt.vt_printf(ESC_CLEAR)
+		}
+		prsatellite(vt, nf)
+		if cycle > 0 {
+			gnssgo.Sleepms(cycle)
+		} else {
+			return
+		}
+	}
+	vt.vt_printf("\n")
+}
+
+/* observ command ------------------------------------------------------------*/
+func cmd_observ(args []string, narg int, vt *VTerm) {
+	var (
+		i     int
+		nf    int = 2
+		cycle int = 0
+	)
+
+	log.Printf("cmd_observ:\n")
+
+	for i = 1; i < narg; i++ {
+		if n, _ := fmt.Sscanf(args[i], "-%d", &nf); n < 1 {
+			f, err := strconv.ParseFloat(args[i], 64)
+			if err != nil {
+				return
+			}
+			cycle = int(f * 1000.0)
+		}
+	}
+	for vt.vt_chkbrk() == 0 {
+		if cycle > 0 {
+			vt.vt_printf(ESC_CLEAR)
+		}
+		prsatellite(vt, nf)
+		if cycle > 0 {
+			gnssgo.Sleepms(cycle)
+		} else {
+			return
+		}
+	}
+	vt.vt_printf("\n")
+}
+
+/* navidata command ----------------------------------------------------------*/
+func cmd_navidata(args []string, narg int, vt *VTerm) {
+	var cycle int = 0
+
+	log.Printf("cmd_navidata:\n")
+
+	if narg > 1 {
+		f, err := strconv.ParseFloat(args[1], 64)
+		if err != nil {
+			return
+		}
+		cycle = int(f * 1000.0)
+	}
+
+	for vt.vt_chkbrk() == 0 {
+		if cycle > 0 {
+			vt.vt_printf(ESC_CLEAR)
+		}
+		prnavidata(vt)
+		if cycle > 0 {
+			gnssgo.Sleepms(cycle)
+		} else {
+			return
+		}
+	}
+	vt.vt_printf("\n")
+}
+
+/* error command -------------------------------------------------------------*/
+func cmd_error(args []string, narg int, vt *VTerm) {
+	log.Printf("cmd_error:\n")
+
+	svr.RtkSvrLock()
+	svr.RtkSvrUnlock()
+
+	for vt.vt_chkbrk() == 0 {
+		prerror(vt)
+		gnssgo.Sleepms(100)
+	}
+	vt.vt_printf("\n")
+}
+
+/* stream command ------------------------------------------------------------*/
+func cmd_stream(args []string, narg int, vt *VTerm) {
+	var cycle int = 0
+
+	log.Printf("cmd_stream:\n")
+
+	if narg > 1 {
+
+	}
+
+	for vt.vt_chkbrk() == 0 {
+		if cycle > 0 {
+			vt.vt_printf(ESC_CLEAR)
+		}
+		prstream(vt)
+		if cycle > 0 {
+			gnssgo.Sleepms(cycle)
+		} else {
+			return
+		}
+	}
+	vt.vt_printf("\n")
+}
+
+/* ssr command ---------------------------------------------------------------*/
+func cmd_ssr(args []string, narg int, vt *VTerm) {
+	var cycle int = 0
+
+	log.Printf("cmd_ssr:\n")
+
+	if narg > 1 {
+		f, err := strconv.ParseFloat(args[1], 64)
+		if err != nil {
+			return
+		}
+		cycle = int(f * 1000.0)
+
+	}
+
+	for vt.vt_chkbrk() == 0 {
+		if cycle > 0 {
+			vt.vt_printf(ESC_CLEAR)
+		}
+		prssr(vt)
+		if cycle > 0 {
+			gnssgo.Sleepms(cycle)
+		} else {
+			return
+		}
+	}
+	vt.vt_printf("\n")
+}
+
+/* option command ------------------------------------------------------------*/
+func cmd_option(args []string, narg int, vt *VTerm) {
+	var buff string
+	var i, n int
+
+	log.Printf("cmd_option:\n")
+
+	for name, opt := range rcvopts {
+		if narg >= 2 && !strings.Contains(name, args[1]) {
+			continue
+		}
+		buff += fmt.Sprintf("%-18s =", name)
+		opt.Opt2Str(&buff)
+		if len(opt.Comment) > 0 {
+			if n = 30 - len(buff); n > 0 {
+				buff += fmt.Sprintf("%*s", n, "")
+			}
+			buff += fmt.Sprintf(" # (%s)", opt.Comment)
+		}
+		s := " "
+		if modflgr[i] > 0 {
+			s = "*"
+		}
+		vt.vt_printf("%s%s\n", s, buff)
+	}
+	for name, opt := range gnssgo.SysOpts {
+		if narg >= 2 && !strings.Contains(name, args[1]) {
+			continue
+		}
+		buff += fmt.Sprintf("%-18s =", name)
+		opt.Opt2Str(&buff)
+		if len(opt.Comment) > 0 {
+			if n = 30 - len(buff); n > 0 {
+				buff += fmt.Sprintf("%*s", n, "")
+			}
+			buff += fmt.Sprintf(" # (%s)", opt.Comment)
+		}
+		s := " "
+		if modflgr[i] > 0 {
+			s = "*"
+		}
+		vt.vt_printf("%s%s\n", s, buff)
+	}
+}
+
+/* set command ---------------------------------------------------------------*/
+func cmd_set(args []string, narg int, vt *VTerm) {
+	var opt *gnssgo.Opt
+	//	var modf []int
+	var buff string
+
+	log.Printf("cmd_set:\n")
+
+	if narg < 2 {
+		vt.vt_printf("specify option type\n")
+		return
+	}
+	if opt = gnssgo.SearchOpt(args[1], rcvopts); opt != nil {
+		//     modf=modflgr[int(opt-rcvopts):];
+	} else if opt = gnssgo.SearchOpt(args[1], gnssgo.SysOpts); opt != nil {
+		//   modf=modflgs+(int)(opt-sysopts);
+	} else {
+		vt.vt_printf("no option type: %s\n", args[1])
+		return
+	}
+	if narg < 3 {
+		vt.vt_printf("%s", opt.Name)
+		if len(opt.Comment) > 0 {
+			vt.vt_printf(" (%s)", opt.Comment)
+		}
+		vt.vt_printf(": ")
+		if vt.vt_gets([]byte(buff), len(buff)) == 0 || vt.brk > 0 {
+			return
+		}
+	} else {
+		buff = args[2]
+	}
+
+	chop(&buff)
+	if opt.Str2Opt(buff) == 0 {
+		vt.vt_printf("invalid option value: %s %s\n", opt.Name, buff)
+		return
+	}
+	gnssgo.GetSysOpts(&prcopt, &solopt[0], &filopt)
+
+	vt.vt_printf("option %s changed.", opt.Name)
+	if strings.Compare(opt.Name[:7], "console") != 0 {
+		//       *modf=1;
+		vt.vt_printf(" restart to enable it")
+	}
+	vt.vt_printf("\n")
+}
+
+/* load command --------------------------------------------------------------*/
+func cmd_load(args []string, narg int, vt *VTerm) {
+	var file string
+
+	log.Printf("cmd_load:\n")
+
+	if narg >= 2 {
+		file = args[1]
+	} else {
+		file = fmt.Sprintf("%s/%s", OPTSDIR, OPTSFILE)
+	}
+	gnssgo.ResetSysOpts()
+	if gnssgo.LoadOpts(file, &gnssgo.SysOpts) == 0 {
+		vt.vt_printf("no options file: %s\n", file)
+		return
+	}
+	gnssgo.GetSysOpts(&prcopt, &solopt[0], &filopt)
+
+	if gnssgo.LoadOpts(file, &rcvopts) == 0 {
+		vt.vt_printf("no options file: %s\n", file)
+		return
+	}
+	vt.vt_printf("options loaded from %s. restart to enable them\n", file)
+}
+
+/* save command --------------------------------------------------------------*/
+func cmd_save(args []string, narg int, vt *VTerm) {
+	var file, comment, s string
+
+	log.Printf("cmd_save:\n")
+
+	if narg >= 2 {
+		file = args[1]
+	} else {
+		file = fmt.Sprintf("%s/%s", OPTSDIR, OPTSFILE)
+	}
+	if confwrite(vt, file) == 0 {
+		return
+	}
+	gnssgo.Time2Str(gnssgo.Utc2GpsT(gnssgo.TimeGet()), &s, 0)
+	comment = fmt.Sprintf("%s options (%s, v.%s %s)", PRGNAME, s, gnssgo.VER_GNSSGO, gnssgo.PATCH_LEVEL)
+	gnssgo.SetSysOpts(&prcopt, &solopt[0], &filopt)
+	if gnssgo.SaveOpts(file, "w", comment, &rcvopts) == 0 || gnssgo.SaveOpts(file, "a", "", &gnssgo.SysOpts) == 0 {
+		vt.vt_printf("options save error: %s\n", file)
+		return
+	}
+	vt.vt_printf("options saved to %s\n", file)
+}
+
+/* log command ---------------------------------------------------------------*/
+func cmd_log(args []string, narg int, vt *VTerm) {
+	log.Printf("cmd_log:\n")
+
+	if narg < 2 {
+		vt.vt_printf("specify log file\n")
+		return
+	}
+	if strings.Compare(args[1], "off") == 0 {
+		vt.vt_closelog()
+		vt.vt_printf("log off\n")
+		return
+	}
+	if confwrite(vt, args[1]) == 0 {
+		return
+	}
+
+	if vt.vt_openlog(args[1]) == 0 {
+		vt.vt_printf("log open error: %s\n", args[1])
+		return
+	}
+	vt.vt_printf("log on: %s\n", args[1])
+}
+
+/* help command --------------------------------------------------------------*/
+func cmd_help(args []string, narg int, vt *VTerm) {
+	var str string = "path"
+	var i int
+
+	if narg < 2 {
+		vt.vt_printf("%s (ver.%s %s)\n", PRGNAME, gnssgo.VER_GNSSGO, gnssgo.PATCH_LEVEL)
+		for i, _ = range helptxt {
+			vt.vt_printf("%s\n", helptxt[i])
+		}
+	} else if strings.Index(str, args[1]) == 0 {
+		for i = 0; len(pathopts[i]) > 0; i++ {
+			vt.vt_printf("%s\n", pathopts[i])
+		}
+	} else {
+		vt.vt_printf("unknown help: %s\n", args[1])
+	}
+}
+
+/* exec command --------------------------------------------------------------*/
+func cmd_exec(cmd string, vt *VTerm) int {
+	var fp *os.File
+	var ret int
+	var buff string
+	var err error
+	if fp, _ = os.OpenFile(cmd, os.O_RDONLY, 666); fp == nil {
+		vt.vt_printf("command exec error\n")
+		return -1
+	}
+	rd := bufio.NewReader(fp)
+	for vt.vt_chkbrk() == 0 {
+		buff, err = rd.ReadString('\n')
+		if err != nil {
+			return -1
+		}
+		vt.vt_printf(buff)
+	}
+	err = fp.Close()
+	if err != nil {
+		vt.vt_printf("command exec error (%s)\n", err)
+	}
+	return ret
+}
+
+/* console thread ------------------------------------------------------------*/
+func con_thread(arg *con_t) {
+	var cmds []string = []string{
+		"start", "stop", "restart", "solution", "status", "satellite", "observ",
+		"navidata", "stream", "ssr", "error", "option", "set", "load", "save", "log",
+		"help", "?", "exit", "shutdown", ""}
+	var con *con_t = arg
+	var i, j, narg int
+	var buff string
+	//,*args[MAXARG],*p;
+
+	defer con.wg.Done()
+
+	log.Printf("console_thread:\n")
+
+	con.vt.vt_printf("\n%s** %s ver.%s %s console (h:help) **%s\n", ESC_BOLD,
+		PRGNAME, gnssgo.VER_GNSSGO, gnssgo.PATCH_LEVEL, ESC_RESET)
+
+	if login(con.vt) == 0 {
+		con.vt.vt_close()
+		con.state = 0
+		return
+	}
+	for con.state > 0 {
+
+		/* output prompt */
+		if con.vt.vt_puts([]byte(CMDPROMPT)) == 0 {
+			break
+		}
+
+		/* input command */
+		if con.vt.vt_gets([]byte(buff), len(buff)) == 0 {
+			break
+		}
+
+		if buff[0] == '!' { /* shell escape */
+			cmd_exec(buff[1:], con.vt)
+			continue
+		}
+		/* parse command */
+		narg = 0
+		args := strings.Fields(buff)
+		// for (p=strtok(buff," \t\n");p&&narg<MAXARG;p=strtok(NULL," \t\n")) {
+		//     args[narg++]=p;
+		// }
+		if narg == 0 {
+			continue
+		}
+
+		for i, j = 0, -1; len(cmds[i]) > 0; i++ {
+			if strings.Index(cmds[i], args[0]) == 0 {
+				j = i
+			}
+		}
+		switch j {
+		case 0:
+			cmd_start(args, narg, con.vt)
+		case 1:
+			cmd_stop(args, narg, con.vt)
+		case 2:
+			cmd_restart(args, narg, con.vt)
+		case 3:
+			cmd_solution(args, narg, con.vt)
+		case 4:
+			cmd_status(args, narg, con.vt)
+		case 5:
+			cmd_satellite(args, narg, con.vt)
+		case 6:
+			cmd_observ(args, narg, con.vt)
+		case 7:
+			cmd_navidata(args, narg, con.vt)
+		case 8:
+			cmd_stream(args, narg, con.vt)
+		case 9:
+			cmd_ssr(args, narg, con.vt)
+		case 10:
+			cmd_error(args, narg, con.vt)
+		case 11:
+			cmd_option(args, narg, con.vt)
+		case 12:
+			cmd_set(args, narg, con.vt)
+		case 13:
+			cmd_load(args, narg, con.vt)
+		case 14:
+			cmd_save(args, narg, con.vt)
+		case 15:
+			cmd_log(args, narg, con.vt)
+		case 16:
+			cmd_help(args, narg, con.vt)
+		case 17:
+			cmd_help(args, narg, con.vt)
+		case 18: /* exit */
+			if con.vt.ttype > 0 {
+				con.state = 0
+			}
+
+		case 19: /* shutdown */
+			if strings.Compare(args[0], "shutdown") == 0 {
+				con.vt.vt_printf("rtk server shutdown ...\n")
+				gnssgo.Sleepms(1000)
+				intflg = 1
+				con.state = 0
+			}
+		default:
+			con.vt.vt_printf("unknown command: %s.\n", args[0])
+			break
+		}
+	}
+	con.vt.vt_close()
+}
+
+/* open console --------------------------------------------------------------*/
+func con_open(sock syscall.Handle, dev string) *con_t {
+	var con *con_t = new(con_t)
+
+	log.Printf("con_open: sock=%d dev=%s\n", sock, dev)
+
+	if con.vt = vt_open(sock, dev); con.vt == nil {
+		con = nil
+		return nil
+	}
+	/* start console thread */
+	con.state = 1
+	con.wg.Add(1)
+	go con_thread(con)
+	// if (pthread_create(&con.thread,NULL,con_thread,con)) {
+	//     free(con);
+	//     return NULL;
+	// }
+	return con
+}
+
+/* thread to send keep alive for monitor port --------------------------------*/
+func sendkeepalive() {
+	log.Printf("sendkeepalive: start\n")
+
+	for keepalive > 0 {
+		moni.StreamWrite([]byte("\r"), 1)
+		gnssgo.Sleepms(INTKEEPALIVE)
+	}
+	log.Printf("sendkeepalive: stop\n")
+}
+
+/* open monitor port ---------------------------------------------------------*/
+func openmoni(port int) int {
+	//   var thread int;
+	var path string
+
+	log.Printf("openmomi: port=%d\n", port)
+
+	path = fmt.Sprintf(":%d", port)
+	if moni.OpenStream(int(gnssgo.STR_TCPSVR), int(gnssgo.STR_MODE_RW), path) == 0 {
+		return 0
+	}
+	moni.StreamSetTimeout(timeout, reconnect)
+	keepalive = 1
+	go sendkeepalive()
+	return 1
+}
+
+/* close monitor port --------------------------------------------------------*/
+func closemoni() {
+	log.Printf("closemoni:\n")
+	keepalive = 0
+
+	/* send disconnect message */
+	moni.StreamWrite([]byte(gnssgo.MSG_DISCONN), len(gnssgo.MSG_DISCONN))
+
+	/* wait fin from clients */
+	gnssgo.Sleepms(1000)
+
+	moni.StreamClose()
+}
+
+/* external stop signal ------------------------------------------------------*/
+func sigshut(sig int) {
+	log.Printf("sigshut: sig=%d\n", sig)
+
+	intflg = 1
+	os.Exit(0)
+}
+
+func main() {
+	// con := make([]*con_t, MAXCON)
+	var port, outstat, trace, sock int
+	var dev, file string
+	var bstart bool = false
+	var start int = 0
+	flag.BoolVar(&bstart, "s", false, searchHelp("-s"))
+	flag.IntVar(&port, "p", port, searchHelp("-p"))
+	flag.IntVar(&moniport, "m", moniport, searchHelp("-m"))
+	flag.StringVar(&dev, "d", dev, searchHelp("-d"))
+	flag.StringVar(&file, "o", file, searchHelp("-o"))
+	flag.StringVar(&passwd, "w", passwd, searchHelp("-w"))
+	flag.IntVar(&outstat, "r", outstat, searchHelp("-r"))
+	flag.IntVar(&trace, "t", trace, searchHelp("-t"))
+	flag.StringVar(&sta_name, "sta", sta_name, searchHelp("-sta"))
+	flag.Parse()
+	if bstart {
+		start = 1
+	}
+	if trace > 0 {
+		gnssgo.TraceOpen(TRACEFILE)
+		gnssgo.TraceLevel(trace)
+	}
+
+	// if (trace>0) {
+	//     traceopen(TRACEFILE);
+	//     tracelevel(trace);
+	// }
+	/* initialize rtk server and monitor port */
+
+	svr.InitRtkSvr()
+	moni.InitStream()
+
+	/* load options file */
+	if len(file) == 0 {
+		file = fmt.Sprintf("%s/%s", OPTSDIR, OPTSFILE)
+	}
+	gnssgo.ResetSysOpts()
+	if gnssgo.LoadOpts(file, &rcvopts) == 0 || gnssgo.LoadOpts(file, &gnssgo.SysOpts) == 0 {
+		fmt.Fprintf(os.Stderr, "no options file: %s. defaults used\n", file)
+		return
+	}
+	gnssgo.GetSysOpts(&prcopt, &solopt[0], &filopt)
+	flag.Parse()
+
+	/* read navigation data */
+	if svr.NavData.ReadNav(NAVIFILE) == 0 {
+		fmt.Fprintf(os.Stderr, "no navigation data: %s\n", NAVIFILE)
+	}
+	if outstat > 0 {
+		gnssgo.RtkOpenStat(STATFILE, outstat)
+	}
+
+	/* open monitor port */
+	if moniport > 0 && openmoni(moniport) == 0 {
+		fmt.Fprintf(os.Stderr, "monitor port open error: %d\n", moniport)
+	}
+	if port != 0 {
+		/* open socket for remote console */
+		if sock = open_sock(port); sock <= 0 {
+			log.Printf("console open error port=%d\n", port)
+			if moniport > 0 {
+				closemoni()
+			}
+			if outstat > 0 {
+				gnssgo.RtkCloseStat()
+			}
+			//traceclose();
+			return
+		}
+	}
+	// } else {
+	// 	/* open device for local console */
+	// 	if con[0] = con_open(0, dev); con[0] == nil {
+	// 		log.Printf("console open error dev=%s\n", dev)
+	// 		if moniport > 0 {
+	// 			closemoni()
+	// 		}
+	// 		if outstat > 0 {
+	// 			gnssgo.RtkCloseStat()
+	// 		}
+	// 		// traceclose();
+	// 		return
+	// 	}
+	// }
+
+	c := make(chan os.Signal)
+	signal.Notify(c, syscall.SIGINT, syscall.SIGTERM, //syscall.SIGUSR2, //no defined under windows
+		syscall.SIGHUP, syscall.SIGPIPE)
+	go func() {
+		for s := range c {
+			switch s {
+			case syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM:
+				sigshut(0)
+			case syscall.SIGPIPE:
+				fmt.Println("usr1 signal", s)
+				//    case syscall.SIGUSR2:
+				// 		   fmt.Println("usr2 signal", s)
+			default:
+				fmt.Println("other signal", s)
+			}
+		}
+	}()
+
+	/* start rtk server */
+	if start > 0 {
+		startsvr(nil)
+	}
+	for intflg == 0 {
+		/* accept remote console connection */
+		//	accept_sock(sock, con)
+		gnssgo.Sleepms(100)
+	}
+	/* stop rtk server */
+	stopsvr(nil)
+
+	/* close consoles */
+	// for i := 0; i < MAXCON; i++ {
+	// 	con_close(con[i])
+	// }
+	if moniport > 0 {
+		closemoni()
+	}
+	if outstat > 0 {
+		gnssgo.RtkCloseStat()
+	}
+
+	/* save navigation data */
+	if svr.NavData.SaveNav(NAVIFILE) == 0 {
+		fmt.Fprintf(os.Stderr, "navigation data save error: %s\n", NAVIFILE)
+	}
+
+}

@@ -1,0 +1,143 @@
+{
+    // 使用 IntelliSense 了解相关属性。 
+    // 悬停以查看现有属性的描述。
+    // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Launch Package",
+            "type": "go",
+            "request": "launch",
+            "mode": "auto",
+            "program": "${fileDirname}",
+            // mx2rtkp spp
+            // "args": [
+            //     "-p", "0",
+            //     "-t",
+            //     "-e",
+            //     "-x", "5",
+            //     "-o", "../../out/result.pos",
+            //      "../../data/bjfs3370.12o","../../data/bjfs3370.12n"
+            // ]
+            // mx2rtkp rtk pos
+            // "args": [
+            //     "-k", "../../data/2.0 RTK(100m)/best.conf",
+            //     "-o", "../../out/wtza0010.pos",
+            //     "-x", "5",
+            //     "../../data/2.0 RTK(100m)/wtza0010.18o", 
+            //     "../../data/2.0 RTK(100m)/wtzs0010.18o", 
+            //     "../../data/2.0 RTK(100m)/brdc0010.18n"
+            // ]
+            // mx2rtkp PPP
+            //    "args": [
+            //         "-k", "../../data/3.0 PPP/PPP_BJFS.conf",
+            //         "-o", "../../out/bjfs3370.pos",
+            //         "-x", "5",
+            //         "../../data/3.0 PPP/bjfs3370.12o",
+            //         "../../data/3.0 PPP/bjfs3370.12n",
+            //         "../../data/3.0 PPP/igs17170.sp3",
+            //         "../../data/3.0 PPP/igs17170.clk"
+            //     ]
+            // mx2rtkp PPP for 海格数据
+            //    "args": [
+            //         "-k", "../../data/3.0 PPP/PPP_BJFS.conf",
+            //         "-sys", "C",
+            //         "-ts", "2022/07/20,02:00:00",
+            //         "-te", "2022/07/20,03:30:00",
+            //         // "-t", "-e",
+            //         "-o", "../../out/2022072010001130.pos",
+            //         "-x", "5",
+            //         "../../data/haige/2022072010001130.obs",
+            //         "../../data/haige/2022072010001130.nav",
+            //         "../../data/haige/WUM0MGXULA_20222030200_01D_05M_CLK.clk",
+            //         "../../data/haige/WUM0MGXULA_20222030200_01D_05M_ORB.sp3"
+            //      ]
+            // mx2rtkp RTD
+            // "args": [
+            //     "-k", "../../data/2.0 RTK(100m)/best.conf",
+            //     "-o", "../../out/wtza0010.pos",
+            //     "-x", "5",
+            //     "-p", "1",  // RTD: DGPS
+            //     "../../data/2.0 RTK(100m)/wtza0010.18o", 
+            //     "../../data/2.0 RTK(100m)/wtzs0010.18o", 
+            //     "../../data/2.0 RTK(100m)/brdc0010.18n"
+            // ]
+            // rtkrcv
+            // "args": [
+            //     "-s",
+            //     "-t",
+            //     "5"
+            //     // "-d", "/dev/vvt"
+            // ]
+            // str2str
+            // "args": [
+            //     "-in", "ntrip://landsd-gncaster.realtime.data.gov.hk:2101/HKCL",
+            //     "-out", "file://E:/Users/fengxb/Codes/gnssgo/out/HKCL%n.RTCM3::S=24",
+            //     "-t", "5"
+            // ]
+            // str2str test4
+            // "args": [
+            //     "-in", "../../data/rcvraw/oemv_200911218.gps#nov",
+            //     "-out", "oem6_20121107.rtcm3#rtcm3",
+            //     "-sta", "123",
+            //     "-msg", "1077(10),1087(10),1097(10),1107(10),1117(10),1019,1020",
+            //     "-t", "5"
+            // ]
+            // convbin
+            // "args": [
+            //     "-r", "rtcm3",
+            //     "-v", "3.02",
+            //     // "-ti", "30",
+            //     "-os",
+            //     "-od",
+            //     // "-ts", "2022/6/23,0:0:0",
+            //     // "-te", "2022/6/23,23:59:59",
+            //     // "-trace", "5",
+            //     "../../out/HKCL174.RTCM3"
+            // ]
+            // convbin for rtcm2
+            // "args": [
+            //     "-d", ".",
+            //     "-tr", "2009/12/18,23:20:00",
+            //     // "-te", "2022/6/23,23:59:59",
+            //     "-trace", "5",
+            //     "../../data/rcvraw/testglo.rtcm2"
+            // ]
+            //convbin for rtcm2
+            "args": [
+                "-d",
+                ".",
+                // "-tr",
+                // "2009/12/18,23:20:00",
+                // "-te", "2022/6/23,23:59:59",
+                "-trace",
+                "5",
+                "../../data/sh0115*.23o",
+            ] //    convbin for rtcm2
+            // "args": [
+            //     "-d",
+            //     ".",
+            //     //"-r",
+            //     //"oem3", // novatel oem3 verstion 
+            //     // "-tr", "2009/12/18,23:20:00",
+            //     // "-te", "2022/6/23,23:59:59",
+            //     "-trace",
+            //     "5",
+            //     "../../data/rcvraw/0415.stq"
+            // ]
+            // plot
+            //    "args": [
+            //         // "-ti", "30",
+            //         "-ts", "2018/01/01,00:00:00",
+            //         "-te", "2018/01/01,23:59:59",
+            //         // "-trace", "5",
+            //         "../../out/wtza0010.pos"
+            //     ]
+            // pos2kml
+            //    "args": [
+            //          "-ag", "-tu",// "-gpx",
+            //          "../../out/bjfs3370.pos"
+            //     ]
+        }
+    ]
+}

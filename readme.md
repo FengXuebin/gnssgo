@@ -8,6 +8,10 @@ The development branch for golang version of RTKLIB 2.4.3.
 
 RTKLIB is an excellent tool for GNSS development and research. Golang became population in recent. According to requirement of project, I recoded RTKLIB with golang for almost one years.
 
+Due to limitaion of commit folder size, I didn't commit Data. If you want to test the project, you could download from RTKLIB.
+
+Author: Dr. Feng Xuebin, IDT Ltd., co
+
 # UPDATE HISTORY
 
 
