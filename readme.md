@@ -14,8 +14,12 @@ Author: Dr. Feng Xuebin, IDT Ltd., co
 
 # UPDATE HISTORY
 
-
 2023/06/06 1.0 
+
+# Build and Installation
+In file go.work, you could choose your app by uncommenting app path.
+
+For confiuring app, you could define command arguments in file luanch.json under directory .vscode.
     
     GENERAL:
         NavIC (IRNSS) completely supported.
